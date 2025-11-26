@@ -2665,7 +2665,7 @@ def multi_broadcast_in_dim(ctx: LoweringRuleContext,
       out.append(op if op_aval_sharding == out_sharding else
                  lower_with_sharding_in_types(ctx, op, out_aval))
     else:
-      assert len(op_aval_shape) <= len(out_shape), (op_aval_shape, out_shape)
+      assert len(op_aval_shape) <= len(out_shape), breakpoint() #(op_aval_shape, out_shape)
       broadcast_dimensions = list(range(len(out_shape) - len(op_aval_shape), len(out_shape)))
       b_out = broadcast_in_dim(
           ctx, op, out_aval, broadcast_dimensions=broadcast_dimensions)

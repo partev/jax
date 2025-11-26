@@ -5475,30 +5475,14 @@ def _dot_batch_rule(
 
   lhs, rhs = unpack_args(batched_args)
   lbd, rbd = unpack_dims(batch_dims)
-  left_stack_dim = lbd.stacked_axis if type(lbd) is RaggedAxis else lbd
-  right_stack_dim = rbd.stacked_axis if type(rbd) is RaggedAxis else rbd
   new_dimension_numbers, result_stack_dim = _dot_general_batch_dim_nums(
-      (np.ndim(lhs), np.ndim(rhs)), (left_stack_dim, right_stack_dim),
+      (np.ndim(lhs), np.ndim(rhs)), (lbd, rbd),
       dimension_numbers)
-  # TODO Should probably check that any ragged dimensions have corresponding
-  # sizes, because otherwise the dot product is technically undefined.
-  #
-  # This masking is not strictly necessary for non-contraction dimensions;
-  # we could micro-optimize here by avoiding computing that mask.
-  if type(lbd) is RaggedAxis:
-    lhs = batching.mask_ragged_axes(lhs, _get_sum_identity, lbd)
-    lhs_shape = batching.bdim_as_shape(lbd, lhs.shape)
-  else:
-    lhs_shape = np.shape(lhs)
-  if type(rbd) is RaggedAxis:
-    rhs = batching.mask_ragged_axes(rhs, _get_sum_identity, rbd)
-    rhs_shape = batching.bdim_as_shape(rbd, rhs.shape)
-  else:
-    rhs_shape = np.shape(rhs)
 
-  result_batch_dim = batching.shape_as_bdim(
-      result_stack_dim,
-      _dot_general_shape_computation(lhs_shape, rhs_shape, new_dimension_numbers))
+  lhs_shape = np.shape(lhs)
+  rhs_shape = np.shape(rhs)
+  result_shape = _dot_general_shape_computation(lhs_shape, rhs_shape, new_dimension_numbers)
+  result_batch_dim = canonicalize_axis(result_stack_dim, len(result_shape))
 
   if out_sharding is not None:
     out_sharding = batching.get_sharding_for_vmap(
@@ -6503,58 +6487,24 @@ def _broadcast_in_dim_transpose_rule(ct, operand,
 
 def _broadcast_in_dim_batch_rule(axis_data, batched_args, batch_dims, shape,
                                  broadcast_dimensions, sharding):
-  # `shape` is the target shape, with `None` for dynamic sections.
-  # broadcast_dimensions gives indices where dimensions of the input
-  # have to go: dimension i of the input becomes dimension
-  # broadcast_dimensions[i] of the output.
-  operand = batched_args
-  operand_bdim, *dyn_shape_bdims = batch_dims
-
-  stacked_size = None
-  if operand_bdim is not None:
-    if isinstance(operand_bdim, RaggedAxis):
-      stacked_axis = operand_bdim.stacked_axis
-      stacked_size = operand_bdim.size
-    else:
-      stacked_axis = operand_bdim
-      stacked_size = operand.shape[stacked_axis]
-    new_operand = batching.moveaxis(operand, stacked_axis, 0)
-    new_broadcast_dimensions = (0,) + tuple(np.add(1, broadcast_dimensions))
-  else:
-    new_operand = operand
-    new_broadcast_dimensions = tuple(np.add(1, broadcast_dimensions))
-
-  # TODO(mattjj,axch) This section assumes that the shape of the operand is
-  # broadcast-compatible with the requested shape.  We should tweak vmap to run
-  # the abstract_eval rule so this can be checked while the raggedness
-  # information is available.
-  dyn_limits = []
-  out_ragged_sizes = []
-  for sizes, bdim in zip(dyn_shape, dyn_shape_bdims):
-    if bdim is None:
-      # TODO(mattjj,axch) Is this what bdim == None means?
-      assert isinstance(sizes, int)
-      bound = sizes
-    else:
-      bound = sizes.dtype.bound
-      out_ragged_sizes.append(sizes)
-      if stacked_size is None:
-        stacked_size = len(sizes)
-      else:
-        msg = "All segments lengths arrays must be the same length"
-        assert len(sizes) == stacked_size, msg
-    dyn_limits.append(bound)
-  new_shape = (stacked_size,) + _merge_dyn_shape(shape, dyn_limits)
+  # `shape` is the target shape. broadcast_dimensions gives indices where
+  # dimensions of the input have to go: dimension i of the input becomes
+  # dimension broadcast_dimensions[i] of the output.
+  operand, = batched_args
+  operand_bdim, = batch_dims
+  assert operand_bdim is not None
+  stacked_axis = operand_bdim
+  stacked_size = operand.shape[stacked_axis]
+  new_operand = batching.moveaxis(operand, stacked_axis, 0)
+  new_broadcast_dimensions = (0,) + tuple(np.add(1, broadcast_dimensions))
+  new_shape = (stacked_size,) + shape
 
   if sharding is not None:
     sharding = batching.get_sharding_for_vmap(axis_data, sharding, 0)
 
   result = broadcast_in_dim(new_operand, new_shape, new_broadcast_dimensions,
                             out_sharding=sharding)
-  out_ragged_axes = [idx+1 for idx, s in enumerate(shape) if s is None]
-  out_bdim = batching.make_batch_axis(
-      result.ndim, 0, zip(out_ragged_axes, out_ragged_sizes))
-  return result, out_bdim
+  return result, 0
 
 def _broadcast_in_dim_fwd_rule(eqn):
   v, *dyn = eqn.invars

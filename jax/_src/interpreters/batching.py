@@ -168,6 +168,8 @@ class BatchTracer(Tracer):
       return aval
     elif type(self.batch_dim) is int:
       return core.mapped_aval(aval.shape[self.batch_dim], self.batch_dim, aval)
+    else:
+      raise Exception("batch dim should be int or `not_mapped`")
 
   def full_lower(self):
     if self.batch_dim is not_mapped:
@@ -286,7 +288,7 @@ class BatchTrace(Trace):
     with core.set_current_trace(self.parent_trace):
       vals_out = call_primitive.bind(f_, *vals, **params)
     src = source_info_util.current()
-    return [BatchTracer(self, v, d, src) for v, d in zip(vals_out, dims_out)]
+    return [BatchTracer(self, v, d, src) for v, d in zip(vals_out, dims_out())]
 
   def process_map(self, map_primitive, f: lu.WrappedFun, tracers, params):
     vals, dims = unzip2(map(self.to_batch_info, tracers))
@@ -456,6 +458,37 @@ def _locate_value(key, in_vals, out_vals):
   assert False, "Could not find segment lengths"
 
 ### API for batching jaxprs
+
+def batch_jaxpr2(
+    closed_jaxpr: core.ClosedJaxpr,
+    axis_data,
+    in_axes: tuple[int | NotMapped ],
+  ) -> tuple[core.ClosedJaxpr, tuple[int | NotMapped ]]:
+  return _batch_jaxpr2(closed_jaxpr, axis_data, tuple(in_axes))
+
+@weakref_lru_cache
+def _batch_jaxpr2(
+    closed_jaxpr: core.ClosedJaxpr,
+    axis_data,
+    in_axes: tuple[int | NotMapped ],
+  ) -> tuple[core.ClosedJaxpr, tuple[int | NotMapped, ...]]:
+  f = lu.wrap_init(core.jaxpr_as_fun(closed_jaxpr),
+                   debug_info=closed_jaxpr.jaxpr.debug_info)
+  f, out_axes = _batch_jaxpr_inner(f, axis_data)
+  f = _batch_jaxpr_outer(f, axis_data, in_axes)
+  avals_in2 = []
+  for aval, b in unsafe_zip(closed_jaxpr.in_avals, in_axes):
+    if b is not_mapped:
+      avals_in2.append(aval)
+    else:
+      aval = core.unmapped_aval(
+          axis_data.size, b, aval, axis_data.explicit_mesh_axis)
+      if axis_data.spmd_name is not None:
+        if config._check_vma.value:
+          aval = aval.update(vma=aval.vma | frozenset(axis_data.spmd_name))  # type: ignore
+      avals_in2.append(aval)
+  jaxpr_out, _, consts = pe.trace_to_jaxpr_dynamic(f, avals_in2)
+  return core.ClosedJaxpr(jaxpr_out, consts), out_axes()
 
 def batch_jaxpr(closed_jaxpr, axis_data, in_batched, instantiate):
   inst = tuple(instantiate) if isinstance(instantiate, list) else instantiate
